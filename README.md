@@ -18,8 +18,7 @@ them **non-destructively** as usable samples. Three types: a **drum break**
    chroma/spectral entropy, RMS envelope and onset strength give one
    *sparseness* score per bar.
 4. **Candidate detection** (rule-based per type) — break / solo / tail.
-5. **Targeted Demucs pass** — `htdemucs_ft` runs **only** on candidate windows.
-6. **Audio-aware cutting + export** — per-type stem choice, anti-click fades,
+5. **Audio-aware cutting + export** — per-type stem choice, anti-click fades,
    resampling, and a metadata-rich filename.
 
 Precision over recall: only sparse passages are mined, so the candidates are
