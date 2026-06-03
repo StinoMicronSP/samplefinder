@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install (alleen numpy + testtools; geen audio nodig)
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pytest pyflakes
+      - name: Lint (pyflakes)
+        run: python -m pyflakes sample_finder.py
+      - name: Compile-check
+        run: python -m py_compile sample_finder.py
+      - name: Unit tests
+        run: python -m pytest tests/ -q

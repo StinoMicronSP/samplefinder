@@ -12,6 +12,13 @@ exported clip is a candidate you can demux afterwards.
 > source of truth and embeds the complete script. Keep `sample_finder.py` and the
 > script block in `CLAUDE.md` in sync.
 
+## Download (Windows)
+
+Grab `SampleFinder-<version>-win64.exe` from the [Releases](../../releases) page —
+a single file with **ffmpeg bundled in**, no Python needed. Double-click it to pick
+a file/folder, see the detected candidates, and choose an export resolution; or run
+it from a terminal exactly like the CLI below (`SampleFinder.exe analyze ...`).
+
 ## How it works
 
 1. **Ingest + metadata** — read-only decode (libsndfile, ffmpeg fallback for broad
@@ -91,6 +98,26 @@ Copy `sample_finder.config.example.json` to `sample_finder.config.json`, edit th
 keys you care about (omitted keys keep their defaults), and both the CLI and the
 double-click mode pick it up automatically. See [`CLAUDE.md`](CLAUDE.md) §6 for the
 full reference and §7 for the filename template.
+
+## Build & release
+
+The Windows `.exe` is built by GitHub Actions: push a tag `vX.Y.Z` (or run the
+**release** workflow manually) and `.github/workflows/release.yml` builds
+`SampleFinder.exe` with PyInstaller, bundles ffmpeg (via `imageio-ffmpeg`), and
+attaches it to the Release. Build locally with:
+
+```bash
+pip install -r requirements-dev.txt
+pyinstaller --noconfirm SampleFinder.spec      # -> dist/SampleFinder(.exe)
+```
+
+The binary is large (~150 MB — librosa/numba/scipy are inside) and self-extracts on
+first launch; that's normal for this stack. Tests run on every push (`tests`
+workflow: pyflakes + the audio-free unit tests):
+
+```bash
+pip install numpy pytest && python -m pytest tests/ -q
+```
 
 ## Status
 

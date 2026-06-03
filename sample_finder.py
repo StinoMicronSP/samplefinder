@@ -289,13 +289,37 @@ def probe_source_props(path: str) -> dict:
     return props
 
 
+def _ffmpeg() -> str:
+    """Vind het ffmpeg-binary: env-override, gebundeld (frozen .exe), of op PATH."""
+    import shutil
+    cand = os.environ.get("SAMPLEFINDER_FFMPEG") or os.environ.get("IMAGEIO_FFMPEG_EXE")
+    if cand and Path(cand).exists():
+        return cand
+    roots = []
+    if getattr(sys, "frozen", False):                 # PyInstaller-bundel
+        roots.append(Path(getattr(sys, "_MEIPASS", ".")))
+        roots.append(Path(sys.executable).parent)
+    for r in roots:
+        for n in ("ffmpeg.exe", "ffmpeg"):
+            if (r / n).exists():
+                return str(r / n)
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def _have_ffmpeg() -> bool:
+    """True als er een bruikbaar ffmpeg-binary gevonden wordt."""
+    import shutil
+    exe = _ffmpeg()
+    return bool(Path(exe).exists() or shutil.which(exe))
+
+
 def _ffmpeg_decode(path: str, target_sr=None, mono=False):
     """Fallback-decoder via ffmpeg -> float32; dekt formaten die libsndfile mist."""
     import soundfile as sf
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp.close()
     try:
-        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(path)]
+        cmd = [_ffmpeg(), "-y", "-v", "error", "-i", str(path)]
         if mono:
             cmd += ["-ac", "1"]
         if target_sr:
@@ -316,13 +340,18 @@ def _ffmpeg_decode(path: str, target_sr=None, mono=False):
 
 
 def _decode(path: str, target_sr=None, mono=False):
-    """Decode via librosa (soundfile/audioread); val terug op ffmpeg."""
+    """Decode via libsndfile/librosa; val stil terug op ffmpeg voor brede dekking."""
     try:
         import librosa
         return librosa.load(path, sr=target_sr, mono=mono)
-    except Exception as e:
-        print(f"[decode] libsndfile/librosa faalde ({e}); val terug op ffmpeg")
+    except Exception:
+        pass
+    try:
         return _ffmpeg_decode(path, target_sr=target_sr, mono=mono)
+    except Exception as e:
+        raise RuntimeError(
+            f"kon audio niet decoderen: {Path(path).name} "
+            f"(geen geldig/ondersteund audiobestand, of ffmpeg ontbreekt?)") from e
 
 
 def load_mix_mono(path: str, sr: int):
@@ -687,7 +716,7 @@ def export_candidate(meta, cand, src_audio, src_sr, src_props, out_dir, spec):
         tmp = out_dir / (fname + ".tmp.wav")
         sf.write(str(tmp), audio.T, out_sr, subtype="PCM_24")
         try:
-            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(tmp), "-vn",
+            subprocess.run([_ffmpeg(), "-y", "-v", "error", "-i", str(tmp), "-vn",
                             "-b:a", f"{br}k", str(out_dir / fname)], check=True,
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         finally:
@@ -748,9 +777,14 @@ def export_one(input_path, out_dir, types, index, spec):
         print("  niets te exporteren.")
         return
     res = resolve_export_spec(spec, src_props)
-    if res["fmt"] not in PCM_FORMATS and (res.get("bit_depth") or 0) > 16:
-        print("  LET OP: lossy export -- bit-depth telt niet; hogere resolutie "
-              "voegt geen informatie toe.")
+    if res["fmt"] not in PCM_FORMATS:
+        if not _have_ffmpeg():
+            print(f"  ffmpeg niet gevonden -- vereist voor '{res['fmt']}'-export. "
+                  "Installeer ffmpeg (op PATH) of kies wav/flac/aiff.")
+            return
+        if (res.get("bit_depth") or 0) > 16:
+            print("  LET OP: lossy export -- bit-depth telt niet; hogere resolutie "
+                  "voegt geen informatie toe.")
     src, src_sr = load_source_audio(input_path)
     track_out = Path(out_dir) / Path(input_path).stem
     print(f"  export {len(cands)} clip(s) uit de mix als '{res['fmt']}' "
@@ -950,4 +984,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()   # nodig voor een bevroren (.exe) build
     main()

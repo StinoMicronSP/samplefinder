@@ -1,0 +1,5 @@
+# Dev/test dependencies (de unit-tests raken geen audio, dus enkel numpy + pytest).
+-r requirements.txt
+pytest
+pyflakes
+pyinstaller
