@@ -69,3 +69,5 @@ jobs:
         with:
           files: ${{ env.ASSET }}
           generate_release_notes: true
+          # tags met een streepje (bv. v2.0.0-rc1) -> markeren als pre-release
+          prerelease: ${{ contains(github.ref_name, '-') }}
