@@ -1,0 +1,19 @@
+{
+  "_comment": "Kopieer dit naar 'sample_finder.config.json' (naast je audio, in de werkmap, of geef het mee met --config) en pas de drempels aan. Sleutels die je weglaat houden hun default. Sleutels die met '_' beginnen worden genegeerd. Zie ook `python sample_finder.py analyze --help`.",
+  "_voorbeeld_losser": "voor materiaal als het testnummer: sparseness_min 0.40, solo_chroma_entropy_max 0.86",
+
+  "sparseness_min": 0.55,
+
+  "break_perc_ratio_min": 0.62,
+  "break_chroma_entropy_max": 0.78,
+  "break_min_bars": 1,
+
+  "solo_perc_ratio_max": 0.40,
+  "solo_chroma_entropy_max": 0.55,
+  "solo_min_bars": 2,
+
+  "tail_rms_drop_db": -18.0,
+  "tail_silence_db": -55.0,
+  "tail_min_dur_s": 0.4,
+  "tail_lookback_bars": 2
+}

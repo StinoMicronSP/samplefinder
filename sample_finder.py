@@ -12,6 +12,12 @@ GEBRUIK (drie manieren):
 
 Invoer mag een ENKEL BESTAND of een MAP zijn (batch). Met --recursive ook submappen.
 
+DREMPELS INSTELBAAR (zonder de broncode te wijzigen):
+  * losse vlaggen, bv. --sparseness-min 0.42 --solo-chroma-entropy-max 0.82
+  * --set KEY=VALUE (herhaalbaar), bv. --set solo_min_bars=2 --set tail_min_dur_s=0.3
+  * --config pad/naar.json, of leg `sample_finder.config.json` naast je invoer
+    (wordt automatisch geladen). Zie `analyze --help` voor alle drempels.
+
 ONTWERPKEUZES (vastgelegd in overleg):
   * allin1 (of librosa-fallback) levert beats/downbeats/structuur.
   * Goedkope density-detector op de MIX vindt de sparse vensters.
@@ -69,6 +75,78 @@ CFG = {
 DEMUCS_SOURCES = ["drums", "bass", "other", "vocals"]
 AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".aif", ".aiff",
               ".ogg", ".wma", ".opus", ".aac"}
+
+# Optioneel sidecar-configbestand: ligt het naast de invoer of in de werkmap,
+# dan worden de CFG-drempels er automatisch uit overschreven (zie resolve_tuning).
+CONFIG_FILENAME = "sample_finder.config.json"
+
+
+def _coerce_cfg(key, val):
+    """Cast een override-waarde naar het type van de bestaande CFG-default."""
+    cur = CFG[key]
+    if isinstance(cur, bool):
+        if isinstance(val, str):
+            return val.strip().lower() in ("1", "true", "yes", "y", "on")
+        return bool(val)
+    if isinstance(cur, int):
+        return int(float(val))
+    if isinstance(cur, float):
+        return float(val)
+    return str(val)
+
+
+def apply_cfg_overrides(overrides: dict) -> dict:
+    """Merge overrides in de globale CFG (type-gecoerced naar de default-types).
+
+    Onbekende sleutels worden met een waarschuwing genegeerd; sleutels die met
+    '_' beginnen zijn gereserveerd voor commentaar in config-bestanden. Geeft de
+    daadwerkelijk toegepaste {sleutel: waarde} terug.
+    """
+    applied = {}
+    for k, v in (overrides or {}).items():
+        if isinstance(k, str) and k.startswith("_"):
+            continue
+        if k not in CFG:
+            print(f"[cfg] onbekende drempel genegeerd: {k}")
+            continue
+        try:
+            CFG[k] = _coerce_cfg(k, v)
+            applied[k] = CFG[k]
+        except (ValueError, TypeError) as e:
+            print(f"[cfg] kon {k}={v!r} niet toepassen ({e})")
+    return applied
+
+
+def load_config_file(path) -> dict:
+    """Lees CFG-overrides uit JSON. Accepteert {..} of {'CFG': {..}}."""
+    p = Path(path)
+    if not p.exists():
+        print(f"[cfg] config niet gevonden: {path}")
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[cfg] kon config niet lezen ({path}): {e}")
+        return {}
+    if isinstance(data, dict) and isinstance(data.get("CFG"), dict):
+        data = data["CFG"]
+    return data if isinstance(data, dict) else {}
+
+
+def find_sidecar_config(search_dirs):
+    """Geef het eerste bestaande CONFIG_FILENAME terug uit search_dirs."""
+    seen = set()
+    for d in search_dirs:
+        if not d:
+            continue
+        d = str(d)
+        if d in seen:
+            continue
+        seen.add(d)
+        cand = Path(d) / CONFIG_FILENAME
+        if cand.exists():
+            return str(cand)
+    return None
 
 
 @dataclass
@@ -552,6 +630,8 @@ def interactive_main():
     out_dir = str(base / "sample_finder_out")
     print(f"\n{len(files)} bestand(en). Output -> {out_dir}\n")
 
+    resolve_tuning(search_dirs=[base])
+
     # analyse eerst
     _run_batch(files, out_dir, ["break", "solo", "tail"], "librosa",
                do_export=False, fmt="wav", bit_depth=24, samplerate=None, bitrate=320)
@@ -572,6 +652,69 @@ def interactive_main():
     _pause()
 
 
+# ----------------------------------------------------------------------------
+# Drempels instelbaar maken (CLI-vlaggen / --set / config-bestand)
+# ----------------------------------------------------------------------------
+# (vlag, CFG-sleutel, type, hulptekst). Alleen de detectie-drempels krijgen een
+# eigen vlag; elke andere CFG-sleutel blijft bereikbaar via --set of --config.
+THRESHOLD_FLAGS = [
+    ("--sparseness-min", "sparseness_min", float, "min. sparseness-score per maat"),
+    ("--break-perc-ratio-min", "break_perc_ratio_min", float, "break: min. percussie-ratio"),
+    ("--break-chroma-entropy-max", "break_chroma_entropy_max", float, "break: max. chroma-entropie"),
+    ("--break-min-bars", "break_min_bars", int, "break: min. aantal maten"),
+    ("--solo-perc-ratio-max", "solo_perc_ratio_max", float, "solo: max. percussie-ratio"),
+    ("--solo-chroma-entropy-max", "solo_chroma_entropy_max", float, "solo: max. chroma-entropie"),
+    ("--solo-min-bars", "solo_min_bars", int, "solo: min. aantal maten"),
+    ("--tail-rms-drop-db", "tail_rms_drop_db", float, "tail: toegestane RMS-daling (dB)"),
+    ("--tail-silence-db", "tail_silence_db", float, "tail: stilte-drempel (dB)"),
+    ("--tail-min-dur-s", "tail_min_dur_s", float, "tail: min. duur (s)"),
+    ("--tail-lookback-bars", "tail_lookback_bars", float, "tail: terugkijk in maten"),
+]
+
+
+def add_tuning_args(sp):
+    """Voeg drempel-/config-vlaggen toe aan een subcommando-parser."""
+    g = sp.add_argument_group(
+        "drempels",
+        "overschrijf CFG zonder de broncode te wijzigen "
+        "(prioriteit: config-bestand < losse vlaggen < --set)")
+    g.add_argument("--config", default=None,
+                   help=f"JSON met CFG-overrides (auto: {CONFIG_FILENAME} naast invoer/werkmap)")
+    g.add_argument("--set", dest="cfg_set", action="append", default=[],
+                   metavar="KEY=VALUE",
+                   help="overschrijf één CFG-sleutel; herhaalbaar (bv. --set solo_min_bars=2)")
+    for flag, key, typ, helptxt in THRESHOLD_FLAGS:
+        g.add_argument(flag, dest=f"cfg_{key}", type=typ, default=None, help=helptxt)
+
+
+def resolve_tuning(args=None, search_dirs=()):
+    """Verzamel en pas CFG-overrides toe (config-bestand < vlaggen < --set)."""
+    overrides = {}
+    cfg_path = getattr(args, "config", None) if args else None
+    if not cfg_path:
+        cfg_path = find_sidecar_config(list(search_dirs) + [Path.cwd()])
+        if cfg_path:
+            print(f"[cfg] sidecar-config gevonden: {cfg_path}")
+    if cfg_path:
+        overrides.update(load_config_file(cfg_path))
+    if args is not None:
+        for _flag, key, _typ, _h in THRESHOLD_FLAGS:
+            v = getattr(args, f"cfg_{key}", None)
+            if v is not None:
+                overrides[key] = v
+        for item in getattr(args, "cfg_set", []) or []:
+            if "=" not in item:
+                print(f"[cfg] negeer --set zonder '=': {item}")
+                continue
+            k, v = item.split("=", 1)
+            overrides[k.strip()] = v.strip()
+    applied = apply_cfg_overrides(overrides)
+    if applied:
+        print("[cfg] actieve overrides: "
+              + ", ".join(f"{k}={CFG[k]}" for k in sorted(applied)))
+    return applied
+
+
 def main():
     if len(sys.argv) == 1:          # dubbelklik / geen argumenten
         interactive_main()
@@ -590,6 +733,8 @@ def main():
         sp.add_argument("--recursive", action="store_true")
         sp.add_argument("--beat-backend", default="allin1",
                         choices=["allin1", "librosa"])
+        if name in ("analyze", "run"):
+            add_tuning_args(sp)
         if name in ("export", "run"):
             sp.add_argument("--index", nargs="*", type=int, default=None)
             sp.add_argument("--format", default="wav",
@@ -603,6 +748,11 @@ def main():
     if not files:
         print(f"Geen audiobestanden gevonden op: {args.input}")
         sys.exit(1)
+
+    if args.cmd in ("analyze", "run"):
+        in_dir = (args.input if Path(args.input).is_dir()
+                  else str(Path(args.input).parent))
+        resolve_tuning(args, search_dirs=[in_dir])
 
     if args.cmd == "analyze":
         _run_batch(files, args.out_dir, args.types, args.beat_backend,

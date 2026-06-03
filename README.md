@@ -53,9 +53,30 @@ python sample_finder.py run "music/" --recursive --types break solo --beat-backe
 See [`CLAUDE.md`](CLAUDE.md) §6 for the full flag reference, the filename
 template (§7), and the known limitations (§8).
 
+### Tuning detection thresholds
+
+Every `CFG` detection threshold is overridable at runtime — no source edits — on
+`analyze` and `run` (precedence: config file < named flags < `--set`):
+
+```bash
+# named flags (see `analyze --help` for the full list)
+python sample_finder.py analyze "track.mp3" --sparseness-min 0.42 --solo-chroma-entropy-max 0.82
+
+# generic, any CFG key, repeatable
+python sample_finder.py analyze "track.mp3" --set solo_min_bars=2 --set tail_min_dur_s=0.3
+
+# a JSON profile (or drop sample_finder.config.json next to your audio -> auto-loaded)
+python sample_finder.py analyze "track.mp3" --config my_profile.json
+```
+
+Copy `sample_finder.config.example.json` to `sample_finder.config.json`, edit the
+keys you care about (omitted keys keep their defaults), and both the CLI and the
+double-click mode pick it up automatically.
+
 ## Status
 
-v1 — not yet tuned on real audio; the first run is calibration. The thresholds
-in `CFG` (top of `sample_finder.py`) are starting values meant to be adjusted to
-your material. Tail detection is the weakest link; start with
-`--types break solo` if in doubt.
+v1 — the first run is calibration. The thresholds in `CFG` (top of
+`sample_finder.py`) are starting values meant to be adjusted to your material; do
+that at runtime via `--config` / `--set` / named flags (see above), no source
+edits needed. Tail detection is the weakest link; start with `--types break solo`
+if in doubt.
