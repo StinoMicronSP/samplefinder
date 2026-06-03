@@ -13,6 +13,10 @@ from PyInstaller.utils.hooks import collect_all
 
 datas, binaries, hiddenimports = [], [], []
 
+# tkinter wordt lazy (in een functie) geïmporteerd voor de GUI -> expliciet meenemen.
+hiddenimports += ["tkinter", "tkinter.ttk", "tkinter.filedialog",
+                  "tkinter.scrolledtext", "tkinter.messagebox"]
+
 # Pakketten met data-bestanden / lazy-imports die PyInstaller niet altijd
 # automatisch meeneemt. Per pakket defensief: ontbreekt het, sla het over.
 for pkg in ("librosa", "soundfile", "soxr", "audioread", "pooch",

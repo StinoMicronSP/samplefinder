@@ -8,8 +8,8 @@ in bulk -- elke geexporteerde clip is een kandidaat om dan te demuxen.
 Drie types kandidaten: drum-break, solo-instrument, decay/uitklank-tail.
 
 GEBRUIK (drie manieren):
-  1) Dubbelklik / zonder argumenten -> keuzevenster (BESTAND of MAP), analyse,
-     daarna een KEUZEMENU voor de export-resolutie.
+  1) Dubbelklik / zonder argumenten -> kleine GUI: kies BESTAND of MAP, klik
+     Analyseer, bekijk de kandidaten en kies de export-resolutie.
   2) python sample_finder.py analyze "track.mp3" --out-dir ./out
      python sample_finder.py export  "track.mp3" --out-dir ./out --format original
   3) python sample_finder.py run     "C:\\muziek\\map" --recursive
@@ -851,6 +851,205 @@ def interactive_main():
 
 
 # ----------------------------------------------------------------------------
+# Minimale GUI (tkinter) -- standaard bij dubbelklik / geen argumenten
+# ----------------------------------------------------------------------------
+def _maybe_hide_console():
+    """Verberg het console-venster bij een dubbelklik-start op Windows.
+
+    Alleen als we het console zélf bezitten (1 proces eraan) -- dan is het een
+    dubbelklik. Gestart vanuit cmd/terminal laten we het staan zodat CLI-uitvoer
+    zichtbaar blijft.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        arr = (ctypes.c_uint * 2)()
+        if k32.GetConsoleProcessList(arr, 2) <= 1:
+            hwnd = k32.GetConsoleWindow()
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 0)   # SW_HIDE
+    except Exception:
+        pass
+
+
+def gui_main():
+    """Eén-venster GUI: kies invoer -> Analyseer -> kandidatentabel -> Exporteer."""
+    try:
+        import tkinter as tk
+        from tkinter import ttk, filedialog
+        from tkinter.scrolledtext import ScrolledText
+    except Exception as e:
+        print(f"tkinter niet beschikbaar ({e}); val terug op console.")
+        return interactive_main()
+
+    import contextlib
+    import queue
+    import threading
+
+    try:
+        root = tk.Tk()
+    except Exception as e:                       # bv. headless: geen display
+        print(f"GUI kon niet starten ({e}); val terug op console.")
+        return interactive_main()
+
+    _maybe_hide_console()
+    root.title("Sample Finder v2  --  sparse-section finder")
+    root.geometry("880x620")
+    ui_q = queue.Queue()
+    state = {"files": [], "out_dir": None, "busy": False}
+
+    class _QueueWriter:
+        def write(self, s):
+            if s:
+                ui_q.put(("log", s))
+            return len(s)
+
+        def flush(self):
+            pass
+
+    # --- invoerrij ---
+    top = ttk.Frame(root, padding=8)
+    top.pack(fill="x")
+    path_var = tk.StringVar()
+    ttk.Label(top, text="Invoer:").pack(side="left")
+    ttk.Entry(top, textvariable=path_var).pack(side="left", fill="x", expand=True, padx=6)
+
+    def pick_file():
+        p = filedialog.askopenfilename(
+            title="Kies een audiobestand",
+            filetypes=[("Audio", "*.wav *.mp3 *.m4a *.flac *.aif *.aiff *.ogg "
+                                  "*.opus *.aac *.wma"), ("Alle bestanden", "*.*")])
+        if p:
+            path_var.set(p)
+
+    def pick_dir():
+        p = filedialog.askdirectory(title="Kies een map met audio")
+        if p:
+            path_var.set(p)
+
+    ttk.Button(top, text="Bestand…", command=pick_file).pack(side="left")
+    ttk.Button(top, text="Map…", command=pick_dir).pack(side="left", padx=(4, 0))
+
+    # --- opties + acties ---
+    opt = ttk.Frame(root, padding=(8, 0))
+    opt.pack(fill="x")
+    rec_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(opt, text="Submappen (recursief)", variable=rec_var).pack(side="left")
+    ttk.Label(opt, text="Resolutie:").pack(side="left", padx=(16, 4))
+    res_labels = [lbl for _k, lbl in RES_PRESETS]
+    res_key_by_label = {lbl: k for k, lbl in RES_PRESETS}
+    res_var = tk.StringVar(value=res_labels[0])
+    ttk.Combobox(opt, textvariable=res_var, values=res_labels,
+                 state="readonly", width=36).pack(side="left")
+
+    act = ttk.Frame(root, padding=8)
+    act.pack(fill="x")
+    analyze_btn = ttk.Button(act, text="Analyseer")
+    export_btn = ttk.Button(act, text="Exporteer alles")
+    analyze_btn.pack(side="left")
+    export_btn.pack(side="left", padx=6)
+    prog = ttk.Progressbar(act, mode="indeterminate")
+    prog.pack(side="left", fill="x", expand=True, padx=6)
+
+    # --- kandidatentabel ---
+    cols = ("bestand", "#", "type", "start", "eind", "score", "hint", "note")
+    tree = ttk.Treeview(root, columns=cols, show="headings", height=10)
+    for c, w in zip(cols, (190, 28, 60, 70, 70, 56, 60, 220)):
+        tree.heading(c, text=c)
+        tree.column(c, width=w, anchor="w")
+    tree.pack(fill="both", expand=True, padx=8)
+
+    # --- log ---
+    logtext = ScrolledText(root, height=9, wrap="word")
+    logtext.pack(fill="both", expand=False, padx=8, pady=(4, 8))
+
+    def set_busy(b):
+        state["busy"] = b
+        analyze_btn.config(state="disabled" if b else "normal")
+        export_btn.config(state="disabled" if b else "normal")
+        (prog.start if b else prog.stop)()
+
+    def in_thread(fn):
+        if state["busy"]:
+            return
+        set_busy(True)                           # synchroon, vermijdt dubbelklik-race
+        threading.Thread(target=fn, daemon=True).start()
+
+    def worker_analyze():
+        try:
+            with contextlib.redirect_stdout(_QueueWriter()):
+                path = path_var.get().strip()
+                if not path:
+                    print("Kies eerst een bestand of map.")
+                    return
+                files = collect_inputs(path, recursive=rec_var.get())
+                if not files:
+                    print("Geen audiobestanden gevonden.")
+                    return
+                base = Path(path).parent if Path(path).is_file() else Path(path)
+                state["out_dir"] = str(base / "sample_finder_out")
+                state["files"] = files
+                ui_q.put(("clear", None))
+                print(f"{len(files)} bestand(en). Output -> {state['out_dir']}")
+                resolve_tuning(search_dirs=[base])
+                for f in files:
+                    print(f"\n=== {f.name} ===")
+                    try:
+                        _m, cands, _js = analyze_one(
+                            str(f), state["out_dir"], ["break", "solo", "tail"], "librosa")
+                        ui_q.put(("rows", [
+                            (f.name, i, c.type, f"{c.start:.2f}", f"{c.end:.2f}",
+                             f"{c.score:.2f}", c.stem_hint, c.note)
+                            for i, c in enumerate(cands)]))
+                    except Exception as e:
+                        print(f"  FOUT: {e}")
+                print("\nKlaar met analyse.")
+        finally:
+            ui_q.put(("busy", False))
+
+    def worker_export():
+        try:
+            with contextlib.redirect_stdout(_QueueWriter()):
+                if not state["files"]:
+                    print("Analyseer eerst.")
+                    return
+                spec = res_key_by_label.get(res_var.get(), "original")
+                for f in state["files"]:
+                    print(f"\n=== export {f.name} ===")
+                    export_one(str(f), state["out_dir"],
+                               ["break", "solo", "tail"], None, spec)
+                print(f"\nKlaar met export -> {state['out_dir']}")
+        finally:
+            ui_q.put(("busy", False))
+
+    analyze_btn.config(command=lambda: in_thread(worker_analyze))
+    export_btn.config(command=lambda: in_thread(worker_export))
+
+    def poll():
+        try:
+            while True:
+                kind, payload = ui_q.get_nowait()
+                if kind == "log":
+                    logtext.insert("end", payload)
+                    logtext.see("end")
+                elif kind == "busy":
+                    set_busy(payload)
+                elif kind == "clear":
+                    tree.delete(*tree.get_children())
+                elif kind == "rows":
+                    for r in payload:
+                        tree.insert("", "end", values=r)
+        except queue.Empty:
+            pass
+        root.after(100, poll)
+
+    poll()
+    root.mainloop()
+
+
+# ----------------------------------------------------------------------------
 # Drempels instelbaar maken (CLI-vlaggen / --set / config-bestand)
 # ----------------------------------------------------------------------------
 # (vlag, CFG-sleutel, type, hulptekst). Alleen de detectie-drempels krijgen een
@@ -937,8 +1136,8 @@ def spec_from_args(args):
 
 
 def main():
-    if len(sys.argv) == 1:          # dubbelklik / geen argumenten
-        interactive_main()
+    if len(sys.argv) == 1:          # dubbelklik / geen argumenten -> GUI
+        gui_main()
         return
 
     p = argparse.ArgumentParser(description="Sparse-section sample finder (v2, analyse-only)")
