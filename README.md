@@ -1,6 +1,6 @@
 # samplefinder
 
-Identify breaks and intro's and stem-separate them via Demucs.
+Identify breaks and intro's and export them.
 
 A local Python CLI that detects **sparse sections** in a music file and exports
 them **non-destructively** as usable samples. Three types: a **drum break**
