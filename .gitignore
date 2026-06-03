@@ -13,7 +13,11 @@ ENV/
 # --- PyInstaller build-artefacten (zie CLAUDE.md §6C) ---
 build/
 dist/
-*.spec
+# NB: SampleFinder.spec wordt WEL meegecommit (de build-recept).
+# ffmpeg/ wordt in CI gevuld door imageio-ffmpeg en hoort niet in git.
+ffmpeg/
+smoke.wav
+smoke_out/
 
 # --- Sample Finder output (non-destructief: nooit committen) ---
 out/
