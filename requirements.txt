@@ -1,4 +1,4 @@
-# Sample Finder — runtime dependencies (zie CLAUDE.md §5)
+# Sample Finder v2 — runtime dependencies (analyse + mix-export, geen Demucs)
 #
 # Kerndependencies (vereist):
 librosa
@@ -6,8 +6,6 @@ soundfile
 numpy
 scipy
 mutagen
-demucs
-torch
 
 # Optioneel — betere structuuranalyse (beats/downbeats/segmenten via all-in-one).
 # Kan tegenstribbelen op Windows (de `natten`-wheel ontbreekt vaak); gebruik dan
@@ -15,5 +13,9 @@ torch
 #   pip install allin1
 #
 # Buiten pip:
-#   * ffmpeg moet op PATH staan (mp3/m4a decode + lossy export).
+#   * ffmpeg op PATH: brede decode-dekking (m4a/opus/wma/...) + lossy export
+#     (mp3/m4a/aac/opus/ogg/wma). PCM/lossless (wav/flac/aiff) gaat via soundfile.
 #   * tkinter zit in de Python-stdlib (dubbelklik / interactieve modus).
+#
+# NB: Demucs/torch zijn er in v2 bewust UIT. Separatie doe je later, in bulk,
+# als losse stap op de geexporteerde clips.

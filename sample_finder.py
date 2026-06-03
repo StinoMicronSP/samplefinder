@@ -1,16 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-sample_finder.py  -- v1
-Vindt 'sample-bare' SPARSE secties in muziek en exporteert ze non-destructief.
-Types: drum-break, solo-instrument, decay/uitklank-tail.
+sample_finder.py  -- v2 (analyse-only; geen Demucs)
+Vindt 'sample-bare' SPARSE secties in muziek en exporteert die NON-DESTRUCTIEF
+als clips uit de ORIGINELE mix. Er wordt NIET meer gescheiden: dat doe je later
+in bulk -- elke geexporteerde clip is een kandidaat om dan te demuxen.
+
+Drie types kandidaten: drum-break, solo-instrument, decay/uitklank-tail.
 
 GEBRUIK (drie manieren):
-  1) Dubbelklik / zonder argumenten  -> keuzevenster: enkel BESTAND of hele MAP
+  1) Dubbelklik / zonder argumenten -> keuzevenster (BESTAND of MAP), analyse,
+     daarna een KEUZEMENU voor de export-resolutie.
   2) python sample_finder.py analyze "track.mp3" --out-dir ./out
-     python sample_finder.py export  "track.mp3" --out-dir ./out --format wav --bit-depth 24
-  3) python sample_finder.py run     "C:\\muziek\\map" --recursive   (analyze + export ineen)
+     python sample_finder.py export  "track.mp3" --out-dir ./out --format original
+  3) python sample_finder.py run     "C:\\muziek\\map" --recursive
 
 Invoer mag een ENKEL BESTAND of een MAP zijn (batch). Met --recursive ook submappen.
+Alle courante audioformaten werken (wav/mp3/m4a/flac/aiff/ogg/opus/aac/wma); decode
+gaat via libsndfile en valt terug op ffmpeg voor brede dekking.
 
 DREMPELS INSTELBAAR (zonder de broncode te wijzigen):
   * losse vlaggen, bv. --sparseness-min 0.42 --solo-chroma-entropy-max 0.82
@@ -18,24 +24,21 @@ DREMPELS INSTELBAAR (zonder de broncode te wijzigen):
   * --config pad/naar.json, of leg `sample_finder.config.json` naast je invoer
     (wordt automatisch geladen). Zie `analyze --help` voor alle drempels.
 
-ONTWERPKEUZES (vastgelegd in overleg):
-  * allin1 (of librosa-fallback) levert beats/downbeats/structuur.
-  * Goedkope density-detector op de MIX vindt de sparse vensters.
-  * Zware Demucs-pass (htdemucs_ft) draait ALLEEN op die vensters.
-  * Precisie boven recall: enkel sparse stukken.
-  * Snijden audio-aware per type: breaks bar-aligned, tails op het decay-einde.
-  * Non-destructief: bron wordt nooit aangeraakt; output gaat naar aparte map.
+EXPORT-RESOLUTIE:
+  * --format original (default) behoudt de bron-extensie + samplerate
+  * of kies expliciet: wav/flac/aiff/ogg/mp3/m4a/aac/opus/wma
+  * --bit-depth {16,24,32} (PCM), --samplerate <Hz>, --bitrate <kbps> (lossy)
+  * de dubbelklik-modus toont hiervoor een keuzemenu
 
 EERLIJKE KANTTEKENINGEN:
-  * v1, NIET getest op echte audio door de auteur -- eerste run = kalibratie.
-  * Alle drempels onder CFG zijn startwaarden; zet strenger voor meer precisie.
-  * Demucs kan op zeer kale naklanken smeren (out-of-distribution): hoor de tails na.
-  * mp3/m4a -> hoge bit-resolutie voegt GEEN informatie toe.
+  * v2; detectie-drempels onder CFG zijn startwaarden -> ijk ze op jouw materiaal.
+  * Export is de KALE MIX van het venster (geen separatie); demux later in bulk.
+  * lossy bron -> hoge bit-resolutie voegt GEEN informatie toe.
 
 Afhankelijkheden:
-  pip install librosa soundfile numpy scipy mutagen demucs torch
-  (optioneel) pip install allin1        # betere structuur, lastig op Windows
-  + ffmpeg op PATH (mp3/m4a decode + export). tkinter zit in de stdlib.
+  pip install librosa soundfile numpy scipy mutagen
+  (optioneel) pip install allin1     # betere structuur, lastig op Windows
+  + ffmpeg op PATH (decode brede formaten + lossy export). tkinter zit in de stdlib.
 """
 
 import argparse
@@ -44,13 +47,15 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
 import numpy as np
 
 # ----------------------------------------------------------------------------
-# CONFIG  -- pas drempels aan op je eigen materiaal (precisie boven recall)
+# CONFIG  -- detectie-drempels (precisie boven recall). Runtime overschrijfbaar
+# via CLI-vlaggen, --set KEY=VALUE of een config-bestand (zie resolve_tuning).
 # ----------------------------------------------------------------------------
 CFG = {
     "hop_length": 512,
@@ -66,15 +71,16 @@ CFG = {
     "tail_silence_db": -55.0,
     "tail_min_dur_s": 0.4,
     "tail_lookback_bars": 2,
-    "demucs_model": "htdemucs_ft",
-    "demucs_sr": 44100,
     "pad_seconds": 0.05,
     "fade_ms": 5.0,
 }
 
-DEMUCS_SOURCES = ["drums", "bass", "other", "vocals"]
-AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".aif", ".aiff",
-              ".ogg", ".wma", ".opus", ".aac"}
+# In te lezen / uit te schrijven formaten.
+AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".mp4", ".flac", ".aif", ".aiff",
+              ".ogg", ".oga", ".wma", ".opus", ".aac"}
+# PCM/lossless containers gaan via soundfile (bit-depth-controle); de rest
+# (lossy) gaat via ffmpeg (bitrate-controle).
+PCM_FORMATS = {"wav", "flac", "aif", "aiff"}
 
 # Optioneel sidecar-configbestand: ligt het naast de invoer of in de werkmap,
 # dan worden de CFG-drempels er automatisch uit overschreven (zie resolve_tuning).
@@ -157,8 +163,17 @@ class Candidate:
     start_bar: int
     end_bar: int
     score: float
-    dominant_stem: str
+    stem_hint: str        # welke stem je later wil demuxen (drums/other/auto)
     note: str = ""
+
+
+def _cand_from_dict(d: dict) -> "Candidate":
+    """Bouw een Candidate uit JSON; tolerant voor oude sleutels (dominant_stem)."""
+    if "stem_hint" not in d and "dominant_stem" in d:
+        d = {**d, "stem_hint": d["dominant_stem"]}
+    fields = {"type", "start", "end", "start_bar", "end_bar",
+              "score", "stem_hint", "note"}
+    return Candidate(**{k: d[k] for k in fields if k in d})
 
 
 # ----------------------------------------------------------------------------
@@ -193,7 +208,8 @@ def pick_input_dialog():
     else:
         path = filedialog.askopenfilename(
             title="Kies een audiobestand",
-            filetypes=[("Audio", "*.wav *.mp3 *.m4a *.flac *.aif *.aiff *.ogg"),
+            filetypes=[("Audio", "*.wav *.mp3 *.m4a *.flac *.aif *.aiff *.ogg "
+                                  "*.opus *.aac *.wma"),
                        ("Alle bestanden", "*.*")])
     root.destroy()
     return path or None
@@ -207,7 +223,7 @@ def _pause():
 
 
 # ----------------------------------------------------------------------------
-# Stap 0 -- Ingest + metadata (non-destructief: alleen lezen)
+# Stap 0 -- Ingest + metadata + decode (non-destructief: alleen lezen)
 # ----------------------------------------------------------------------------
 def read_metadata(path: str) -> dict:
     meta = {"artist": "", "title": "", "bpm": None}
@@ -233,15 +249,90 @@ def read_metadata(path: str) -> dict:
     return meta
 
 
+def probe_source_props(path: str) -> dict:
+    """Best-effort bron-eigenschappen voor de 'original'-export-resolutie."""
+    props = {"ext": Path(path).suffix.lower().lstrip("."),
+             "samplerate": None, "channels": None,
+             "bitrate_kbps": None, "bit_depth": None}
+    try:
+        import soundfile as sf
+        info = sf.info(str(path))
+        props["samplerate"] = int(info.samplerate)
+        props["channels"] = int(info.channels)
+        st = (info.subtype or "")
+        if "PCM_16" in st:
+            props["bit_depth"] = 16
+        elif "PCM_24" in st:
+            props["bit_depth"] = 24
+        elif "PCM_32" in st or "FLOAT" in st or "DOUBLE" in st:
+            props["bit_depth"] = 32
+    except Exception:
+        pass
+    try:
+        from mutagen import File as MutagenFile
+        mf = MutagenFile(path)
+        info = getattr(mf, "info", None)
+        if info is not None:
+            br = getattr(info, "bitrate", None)
+            if br:
+                props["bitrate_kbps"] = int(round(br / 1000.0))
+            if not props["samplerate"]:
+                srp = getattr(info, "sample_rate", None)
+                if srp:
+                    props["samplerate"] = int(srp)
+            if not props["channels"]:
+                ch = getattr(info, "channels", None)
+                if ch:
+                    props["channels"] = int(ch)
+    except Exception:
+        pass
+    return props
+
+
+def _ffmpeg_decode(path: str, target_sr=None, mono=False):
+    """Fallback-decoder via ffmpeg -> float32; dekt formaten die libsndfile mist."""
+    import soundfile as sf
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    try:
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(path)]
+        if mono:
+            cmd += ["-ac", "1"]
+        if target_sr:
+            cmd += ["-ar", str(int(target_sr))]
+        cmd += ["-c:a", "pcm_f32le", tmp.name]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE)
+        y, sr = sf.read(tmp.name, dtype="float32", always_2d=True)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+    y = y.T  # (channels, samples)
+    if mono:
+        y = y.mean(axis=0) if y.shape[0] > 1 else y[0]
+    return y, sr
+
+
+def _decode(path: str, target_sr=None, mono=False):
+    """Decode via librosa (soundfile/audioread); val terug op ffmpeg."""
+    try:
+        import librosa
+        return librosa.load(path, sr=target_sr, mono=mono)
+    except Exception as e:
+        print(f"[decode] libsndfile/librosa faalde ({e}); val terug op ffmpeg")
+        return _ffmpeg_decode(path, target_sr=target_sr, mono=mono)
+
+
 def load_mix_mono(path: str, sr: int):
-    import librosa
-    y, _ = librosa.load(path, sr=sr, mono=True)
-    return y
+    y, _ = _decode(path, target_sr=sr, mono=True)
+    return np.asarray(y, dtype=np.float32)
 
 
 def load_source_stereo(path: str):
-    import librosa
-    y, sr = librosa.load(path, sr=None, mono=False)
+    y, sr = _decode(path, target_sr=None, mono=False)
+    y = np.asarray(y, dtype=np.float32)
     if y.ndim == 1:
         y = np.stack([y, y])
     return y, sr
@@ -369,9 +460,9 @@ def _merge_bars(bar_class, label, min_bars):
         else:
             if len(run) >= min_bars:
                 score = float(np.mean([r[4] for r in run]))
-                stem = "drums" if label == "break" else "other"
+                hint = "drums" if label == "break" else "other"
                 out.append(Candidate(label, run[0][1], run[-1][2], run[0][0],
-                                      run[-1][0], round(score, 3), stem,
+                                      run[-1][0], round(score, 3), hint,
                                       note=f"{len(run)} maten"))
             run = []
     return out
@@ -419,39 +510,102 @@ def _detect_tails(feat, structure, total_dur):
 
 
 # ----------------------------------------------------------------------------
-# Stap 3 -- Gerichte Demucs-separatie ALLEEN op kandidaat-vensters
+# Stap 3 -- Export-resolutie (presets, CLI-spec, of interactief keuzemenu)
 # ----------------------------------------------------------------------------
-def separate_window(src_stereo, src_sr, t0, t1, device=None):
-    import torch
-    import librosa
-    from demucs.pretrained import get_model
-    from demucs.apply import apply_model
-
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    i0 = max(0, int((t0 - CFG["pad_seconds"]) * src_sr))
-    i1 = min(src_stereo.shape[1], int((t1 + CFG["pad_seconds"]) * src_sr))
-    chunk = src_stereo[:, i0:i1]
-    if src_sr != CFG["demucs_sr"]:
-        chunk = np.stack([
-            librosa.resample(chunk[c], orig_sr=src_sr, target_sr=CFG["demucs_sr"])
-            for c in range(chunk.shape[0])])
-    model = get_model(CFG["demucs_model"])
-    model.to(device).eval()
-    wav = torch.tensor(chunk, dtype=torch.float32).unsqueeze(0).to(device)
-    with torch.no_grad():
-        est = apply_model(model, wav, device=device, progress=False)[0]
-    est = est.cpu().numpy()
-    return {model.sources[i]: est[i] for i in range(len(model.sources))}, CFG["demucs_sr"]
+# (preset-sleutel, label) -- volgorde = volgorde in het keuzemenu.
+RES_PRESETS = [
+    ("original", "Origineel formaat + samplerate (aanrader)"),
+    ("wav24", "WAV 24-bit / 48 kHz"),
+    ("wav16", "WAV 16-bit / 44.1 kHz"),
+    ("wav32", "WAV 32-bit float / originele SR"),
+    ("flac24", "FLAC 24-bit / originele SR"),
+    ("mp3-320", "MP3 320 kbps"),
+]
+PRESET_SPECS = {
+    "wav24": {"fmt": "wav", "bit_depth": 24, "samplerate": 48000, "bitrate": None},
+    "wav16": {"fmt": "wav", "bit_depth": 16, "samplerate": 44100, "bitrate": None},
+    "wav32": {"fmt": "wav", "bit_depth": 32, "samplerate": None, "bitrate": None},
+    "flac24": {"fmt": "flac", "bit_depth": 24, "samplerate": None, "bitrate": None},
+    "mp3-320": {"fmt": "mp3", "bit_depth": None, "samplerate": None, "bitrate": 320},
+}
 
 
-def pick_dominant_stem(stems: dict):
-    e = {k: float(np.sqrt(np.mean(v ** 2))) for k, v in stems.items()}
-    return max(e, key=e.get)
+def _original_spec(src_props):
+    ext = (src_props.get("ext") or "wav").lower()
+    if ext == "aif":
+        ext = "aiff"
+    return {"fmt": ext,
+            "bit_depth": src_props.get("bit_depth") or 24,
+            "samplerate": src_props.get("samplerate"),   # None -> bron-SR bij schrijven
+            "bitrate": src_props.get("bitrate_kbps") or 320}
+
+
+def resolve_export_spec(spec, src_props) -> dict:
+    """Maak een concrete {fmt,bit_depth,samplerate,bitrate} uit preset/string/dict."""
+    if spec is None:
+        spec = "original"
+    if isinstance(spec, str):
+        if spec in ("original", "orig", ""):
+            return _original_spec(src_props)
+        if spec in PRESET_SPECS:
+            return dict(PRESET_SPECS[spec])
+        spec = {"fmt": spec}  # kale formaatnaam
+    base = {"fmt": "wav", "bit_depth": None, "samplerate": None, "bitrate": None}
+    base.update({k: v for k, v in (spec or {}).items()})
+    fmt = (base.get("fmt") or "wav").lower()
+    if fmt in ("original", "orig", ""):
+        out = _original_spec(src_props)
+        for k in ("bit_depth", "samplerate", "bitrate"):  # overlay expliciete waarden
+            if base.get(k) is not None:
+                out[k] = base[k]
+        return out
+    return {"fmt": fmt,
+            "bit_depth": base["bit_depth"] if base["bit_depth"] is not None else 24,
+            "samplerate": base["samplerate"],
+            "bitrate": base["bitrate"] if base["bitrate"] is not None else 320}
+
+
+def pick_resolution_menu(src_props):
+    """Toon het keuzemenu voor export-resolutie (dubbelklik-modus)."""
+    print("\nKies export-resolutie:")
+    for i, (key, label) in enumerate(RES_PRESETS):
+        extra = ""
+        if key == "original":
+            sr = src_props.get("samplerate")
+            extra = f"   [bron: .{src_props.get('ext', '?')}, {sr or '?'} Hz]"
+        print(f"  {i}) {label}{extra}")
+    print(f"  {len(RES_PRESETS)}) Aangepast (formaat / bit-depth / SR / bitrate)")
+    raw = input("Keuze [0]: ").strip() or "0"
+    try:
+        idx = int(raw)
+    except ValueError:
+        idx = 0
+    if 0 <= idx < len(RES_PRESETS):
+        return RES_PRESETS[idx][0]
+    # Aangepast
+    fmt = (input("  Formaat [wav]: ").strip().lower() or "wav")
+    spec = {"fmt": fmt, "bit_depth": None, "samplerate": None, "bitrate": None}
+    if fmt in PCM_FORMATS:
+        try:
+            spec["bit_depth"] = int(input("  Bit-depth [24]: ").strip() or "24")
+        except ValueError:
+            spec["bit_depth"] = 24
+    else:
+        try:
+            spec["bitrate"] = int(input("  Bitrate kbps [320]: ").strip() or "320")
+        except ValueError:
+            spec["bitrate"] = 320
+    sr_in = input("  Samplerate Hz [origineel]: ").strip()
+    if sr_in:
+        try:
+            spec["samplerate"] = int(sr_in)
+        except ValueError:
+            pass
+    return spec
 
 
 # ----------------------------------------------------------------------------
-# Stap 4 -- Audio-aware snijden per type + export
+# Stap 4 -- Audio-aware snijden uit de mix + schrijven (geen separatie)
 # ----------------------------------------------------------------------------
 def _apply_fade(audio, sr):
     n = int(CFG["fade_ms"] / 1000.0 * sr)
@@ -460,6 +614,14 @@ def _apply_fade(audio, sr):
         audio[:, :n] *= ramp
         audio[:, -n:] *= ramp[::-1]
     return audio
+
+
+def cut_region(src_stereo, src_sr, t0, t1):
+    """Knip [t0,t1] (met pad + anti-klik-fade) uit de originele mix."""
+    i0 = max(0, int((t0 - CFG["pad_seconds"]) * src_sr))
+    i1 = min(src_stereo.shape[1], int((t1 + CFG["pad_seconds"]) * src_sr))
+    audio = src_stereo[:, i0:i1].astype(np.float32, copy=True)
+    return _apply_fade(audio, src_sr)
 
 
 def _sanitize(s: str) -> str:
@@ -473,61 +635,54 @@ def _timestamp(sec: float) -> str:
     return f"{int(m):02d}m{s:05.2f}s".replace(".", "")
 
 
-def build_filename(meta, cand, stem, res_tag, ext):
+def build_filename(meta, cand, res_tag, ext):
     artist = _sanitize(meta.get("artist") or "unknown")
     title = _sanitize(meta.get("title") or "untitled")
     pos = (f"bars{cand.start_bar:03d}-{cand.end_bar:03d}"
            if cand.start_bar >= 0 else "free")
     times = f"{_timestamp(cand.start)}-{_timestamp(cand.end)}"
-    label = cand.type if cand.type != "tail" else f"tail-{stem}"
-    return f"{artist}_{title}__{label}__{pos}__{times}__{res_tag}.{ext}"
+    return f"{artist}_{title}__{cand.type}__{pos}__{times}__{res_tag}.{ext}"
 
 
-def export_candidate(meta, cand, src_stereo, src_sr, out_dir,
-                     fmt, bit_depth, samplerate, bitrate, device):
+def export_candidate(meta, cand, src_stereo, src_sr, src_props, out_dir, spec):
+    """Knip de mix-clip en schrijf hem in de gekozen resolutie."""
     import soundfile as sf
     import librosa
 
-    stems, dsr = separate_window(src_stereo, src_sr, cand.start, cand.end, device)
-    if cand.type == "break":
-        stem_name = "drums"
-    elif cand.type == "solo":
-        stem_name = pick_dominant_stem({k: v for k, v in stems.items() if k != "drums"})
-    else:
-        stem_name = pick_dominant_stem(stems)
-    audio = stems[stem_name].copy()
+    res = resolve_export_spec(spec, src_props)
+    fmt = res["fmt"].lower()
+    audio = cut_region(src_stereo, src_sr, cand.start, cand.end)
 
-    if cand.type == "tail":
-        env = np.sqrt(np.mean(audio ** 2, axis=0))
-        thr = 10 ** (CFG["tail_silence_db"] / 20.0) * (env.max() + 1e-9)
-        below = np.where(env < thr)[0]
-        if len(below):
-            audio = audio[:, : below[0] + int(0.02 * dsr)]
-
-    audio = _apply_fade(audio, dsr)
-    if samplerate and samplerate != dsr:
-        audio = np.stack([librosa.resample(audio[c], orig_sr=dsr, target_sr=samplerate)
+    out_sr = res["samplerate"] or src_sr
+    if res["samplerate"] and res["samplerate"] != src_sr:
+        audio = np.stack([librosa.resample(audio[c], orig_sr=src_sr,
+                                            target_sr=res["samplerate"])
                           for c in range(audio.shape[0])])
-        out_sr = samplerate
-    else:
-        out_sr = dsr
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    if fmt in ("wav", "flac"):
-        subtype = {16: "PCM_16", 24: "PCM_24", 32: "FLOAT"}.get(bit_depth, "PCM_24")
-        res_tag = f"{bit_depth}b-{out_sr // 1000}k"
-        fname = build_filename(meta, cand, stem_name, res_tag, fmt)
+
+    if fmt in PCM_FORMATS:
+        bd = res["bit_depth"] or 24
+        if fmt == "flac" and bd == 32:      # FLAC kent geen 32-bit float
+            bd = 24
+        subtype = {16: "PCM_16", 24: "PCM_24", 32: "FLOAT"}.get(bd, "PCM_24")
+        ext = "aiff" if fmt in ("aif", "aiff") else fmt
+        res_tag = f"{bd}b-{out_sr // 1000}k"
+        fname = build_filename(meta, cand, res_tag, ext)
         sf.write(str(out_dir / fname), audio.T, out_sr, subtype=subtype)
     else:
-        res_tag = f"{bitrate}k"
-        fname = build_filename(meta, cand, stem_name, res_tag, fmt)
+        br = res["bitrate"] or 320
+        res_tag = f"{br}k"
+        fname = build_filename(meta, cand, res_tag, fmt)
         tmp = out_dir / (fname + ".tmp.wav")
         sf.write(str(tmp), audio.T, out_sr, subtype="PCM_24")
-        subprocess.run(["ffmpeg", "-y", "-i", str(tmp), "-b:a", f"{bitrate}k",
-                        str(out_dir / fname)], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        tmp.unlink(missing_ok=True)
+        try:
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(tmp), "-vn",
+                            "-b:a", f"{br}k", str(out_dir / fname)], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        finally:
+            tmp.unlink(missing_ok=True)
     print(f"    -> {fname}")
     return fname
 
@@ -537,15 +692,16 @@ def export_candidate(meta, cand, src_stereo, src_sr, out_dir,
 # ----------------------------------------------------------------------------
 def print_candidates(cands):
     print(f"  {len(cands)} kandidaten:")
-    print(f"  {'#':>2} {'type':<6} {'start':>8} {'end':>8} {'score':>6} {'stem':<7} note")
+    print(f"  {'#':>2} {'type':<6} {'start':>8} {'end':>8} {'score':>6} {'hint':<7} note")
     for i, c in enumerate(cands):
         print(f"  {i:>2} {c.type:<6} {c.start:>8.2f} {c.end:>8.2f} "
-              f"{c.score:>6.2f} {c.dominant_stem:<7} {c.note}")
+              f"{c.score:>6.2f} {c.stem_hint:<7} {c.note}")
 
 
 def analyze_one(input_path, out_dir, types, beat_backend):
     print(f"  [1/3] structuur ({beat_backend}) ...")
     meta = read_metadata(input_path)
+    src_props = probe_source_props(input_path)
     structure = get_structure(input_path, beat_backend)
     print(f"        bpm~{structure['bpm']:.1f}, {len(structure['downbeats'])} downbeats")
     print("  [2/3] density-analyse op de mix ...")
@@ -560,38 +716,40 @@ def analyze_one(input_path, out_dir, types, beat_backend):
     out.mkdir(parents=True, exist_ok=True)
     js = out / (Path(input_path).stem + ".candidates.json")
     js.write_text(json.dumps(
-        {"meta": meta, "structure": {"bpm": structure["bpm"]},
+        {"meta": meta, "source": src_props,
+         "structure": {"bpm": structure["bpm"]},
          "candidates": [asdict(c) for c in cands]}, indent=2), encoding="utf-8")
     return meta, cands, js
 
 
-def export_one(input_path, out_dir, types, index, fmt, bit_depth,
-               samplerate, bitrate):
+def export_one(input_path, out_dir, types, index, spec):
     js = Path(out_dir) / (Path(input_path).stem + ".candidates.json")
     if not js.exists():
         print(f"  geen kandidaten-JSON voor {Path(input_path).name}; sla over.")
         return
     data = json.loads(js.read_text(encoding="utf-8"))
     meta = data["meta"]
-    cands = [Candidate(**c) for c in data["candidates"] if c["type"] in types]
+    # Bepaal de 'original'-resolutie uit het ECHTE invoerbestand (altijd aanwezig
+    # bij export); de in JSON bewaarde 'source' is enkel een record.
+    src_props = probe_source_props(input_path) or data.get("source") or {}
+    cands = [_cand_from_dict(c) for c in data["candidates"] if c["type"] in types]
     if index:
         cands = [cands[i] for i in index if 0 <= i < len(cands)]
     if not cands:
         print("  niets te exporteren.")
         return
-    if fmt in ("mp3", "m4a") and bit_depth > 16:
+    res = resolve_export_spec(spec, src_props)
+    if res["fmt"] not in PCM_FORMATS and (res.get("bit_depth") or 0) > 16:
         print("  LET OP: lossy export -- bit-depth telt niet; hogere resolutie "
               "voegt geen informatie toe.")
-    import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     src, src_sr = load_source_stereo(input_path)
     track_out = Path(out_dir) / Path(input_path).stem
-    print(f"  Demucs op {device} ({CFG['demucs_model']}), {len(cands)} venster(s) ...")
+    print(f"  export {len(cands)} clip(s) uit de mix als '{res['fmt']}' "
+          f"-> {track_out}")
     for c in cands:
         print(f"  - {c.type} {c.start:.2f}-{c.end:.2f}s")
         try:
-            export_candidate(meta, c, src, src_sr, track_out, fmt, bit_depth,
-                             samplerate, bitrate, device)
+            export_candidate(meta, c, src, src_sr, src_props, track_out, spec)
         except Exception as e:
             print(f"    overgeslagen ({e})")
 
@@ -599,22 +757,20 @@ def export_one(input_path, out_dir, types, index, fmt, bit_depth,
 # ----------------------------------------------------------------------------
 # CLI + interactieve (dubbelklik) modus
 # ----------------------------------------------------------------------------
-def _run_batch(files, out_dir, types, backend, do_export,
-               fmt, bit_depth, samplerate, bitrate, index=None):
+def _run_batch(files, out_dir, types, backend, do_export, spec=None, index=None):
     for f in files:
         print(f"\n=== {f.name} ===")
         try:
             analyze_one(str(f), out_dir, types, backend)
             if do_export:
-                export_one(str(f), out_dir, types, index, fmt, bit_depth,
-                           samplerate, bitrate)
+                export_one(str(f), out_dir, types, index, spec)
         except Exception as e:
             print(f"  FOUT bij {f.name}: {e}")
 
 
 def interactive_main():
     print("=" * 62)
-    print(" Sample Finder v1  --  sparse-section sample extractor")
+    print(" Sample Finder v2  --  sparse-section finder (analyse + mix-export)")
     print("=" * 62)
     path = pick_input_dialog()
     if not path:
@@ -632,22 +788,21 @@ def interactive_main():
 
     resolve_tuning(search_dirs=[base])
 
-    # analyse eerst
-    _run_batch(files, out_dir, ["break", "solo", "tail"], "librosa",
-               do_export=False, fmt="wav", bit_depth=24, samplerate=None, bitrate=320)
+    types = ["break", "solo", "tail"]
+    for f in files:
+        print(f"\n=== {f.name} ===")
+        try:
+            analyze_one(str(f), out_dir, types, "librosa")
+        except Exception as e:
+            print(f"  FOUT bij {f.name}: {e}")
 
     ans = input("\nKandidaten exporteren? (y/n): ").strip().lower()
     if ans == "y":
-        fmt = (input("Formaat [wav]: ").strip() or "wav")
-        try:
-            bd = int(input("Bit-depth [24]: ").strip() or "24")
-        except ValueError:
-            bd = 24
+        spec = pick_resolution_menu(probe_source_props(str(files[0])))
         print()
         for f in files:
             print(f"=== export {f.name} ===")
-            export_one(str(f), out_dir, ["break", "solo", "tail"], None,
-                       fmt, bd, None, 320)
+            export_one(str(f), out_dir, types, None, spec)
     print("\nKlaar.")
     _pause()
 
@@ -715,15 +870,38 @@ def resolve_tuning(args=None, search_dirs=()):
     return applied
 
 
+def _add_export_args(sp):
+    """Resolutie-/selectievlaggen voor export en run."""
+    sp.add_argument("--index", nargs="*", type=int, default=None,
+                    help="exporteer enkel deze kandidaat-indices")
+    sp.add_argument("--format", default="original",
+                    help="export-formaat: original|wav|flac|aiff|ogg|mp3|m4a|aac|opus|wma")
+    sp.add_argument("--bit-depth", type=int, default=None, choices=[16, 24, 32],
+                    help="PCM bit-depth (wav/flac/aiff)")
+    sp.add_argument("--samplerate", type=int, default=None,
+                    help="doel-samplerate in Hz (default: origineel)")
+    sp.add_argument("--bitrate", type=int, default=None,
+                    help="bitrate in kbps voor lossy formaten (default 320)")
+
+
+def spec_from_args(args):
+    """Bouw een export-spec uit CLI-vlaggen; 'original' als niets gezet is."""
+    if (args.format in ("original", "orig") and args.bit_depth is None
+            and args.samplerate is None and args.bitrate is None):
+        return "original"
+    return {"fmt": args.format, "bit_depth": args.bit_depth,
+            "samplerate": args.samplerate, "bitrate": args.bitrate}
+
+
 def main():
     if len(sys.argv) == 1:          # dubbelklik / geen argumenten
         interactive_main()
         return
 
-    p = argparse.ArgumentParser(description="Sparse-section sample finder (v1)")
+    p = argparse.ArgumentParser(description="Sparse-section sample finder (v2, analyse-only)")
     sub = p.add_subparsers(dest="cmd", required=True)
     for name, helptxt in [("analyze", "detecteer kandidaten"),
-                          ("export", "separeer + snijd + schrijf"),
+                          ("export", "snijd kandidaten uit de mix + schrijf"),
                           ("run", "analyze + export ineen")]:
         sp = sub.add_parser(name, help=helptxt)
         sp.add_argument("input", help="bestand OF map")
@@ -736,12 +914,7 @@ def main():
         if name in ("analyze", "run"):
             add_tuning_args(sp)
         if name in ("export", "run"):
-            sp.add_argument("--index", nargs="*", type=int, default=None)
-            sp.add_argument("--format", default="wav",
-                            choices=["wav", "flac", "mp3", "m4a"])
-            sp.add_argument("--bit-depth", type=int, default=24, choices=[16, 24, 32])
-            sp.add_argument("--samplerate", type=int, default=None)
-            sp.add_argument("--bitrate", type=int, default=320)
+            _add_export_args(sp)
 
     args = p.parse_args()
     files = collect_inputs(args.input, args.recursive)
@@ -756,17 +929,15 @@ def main():
 
     if args.cmd == "analyze":
         _run_batch(files, args.out_dir, args.types, args.beat_backend,
-                   do_export=False, fmt="wav", bit_depth=24,
-                   samplerate=None, bitrate=320)
+                   do_export=False)
     elif args.cmd == "export":
+        spec = spec_from_args(args)
         for f in files:
             print(f"\n=== {f.name} ===")
-            export_one(str(f), args.out_dir, args.types, args.index, args.format,
-                       args.bit_depth, args.samplerate, args.bitrate)
+            export_one(str(f), args.out_dir, args.types, args.index, spec)
     elif args.cmd == "run":
         _run_batch(files, args.out_dir, args.types, args.beat_backend,
-                   do_export=True, fmt=args.format, bit_depth=args.bit_depth,
-                   samplerate=args.samplerate, bitrate=args.bitrate, index=args.index)
+                   do_export=True, spec=spec_from_args(args), index=args.index)
 
 
 if __name__ == "__main__":
