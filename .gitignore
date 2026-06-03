@@ -1,0 +1,27 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.venv/
+venv/
+env/
+ENV/
+
+# --- PyInstaller build-artefacten (zie CLAUDE.md §6C) ---
+build/
+dist/
+*.spec
+
+# --- Sample Finder output (non-destructief: nooit committen) ---
+out/
+sample_finder_out/
+*.candidates.json
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

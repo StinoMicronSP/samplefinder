@@ -1,0 +1,19 @@
+# Sample Finder — runtime dependencies (zie CLAUDE.md §5)
+#
+# Kerndependencies (vereist):
+librosa
+soundfile
+numpy
+scipy
+mutagen
+demucs
+torch
+
+# Optioneel — betere structuuranalyse (beats/downbeats/segmenten via all-in-one).
+# Kan tegenstribbelen op Windows (de `natten`-wheel ontbreekt vaak); gebruik dan
+# `--beat-backend librosa`. Installeer apart wanneer gewenst:
+#   pip install allin1
+#
+# Buiten pip:
+#   * ffmpeg moet op PATH staan (mp3/m4a decode + lossy export).
+#   * tkinter zit in de Python-stdlib (dubbelklik / interactieve modus).
