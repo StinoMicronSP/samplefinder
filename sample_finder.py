@@ -330,11 +330,12 @@ def load_mix_mono(path: str, sr: int):
     return np.asarray(y, dtype=np.float32)
 
 
-def load_source_stereo(path: str):
+def load_source_audio(path: str):
+    """Decode de bron op originele samplerate, kanalen behouden -> (channels, n)."""
     y, sr = _decode(path, target_sr=None, mono=False)
     y = np.asarray(y, dtype=np.float32)
     if y.ndim == 1:
-        y = np.stack([y, y])
+        y = y[None, :]            # mono -> (1, n); NIET dupliceren naar stereo
     return y, sr
 
 
@@ -534,10 +535,12 @@ def _original_spec(src_props):
     ext = (src_props.get("ext") or "wav").lower()
     if ext == "aif":
         ext = "aiff"
+    is_pcm = ext in PCM_FORMATS
     return {"fmt": ext,
-            "bit_depth": src_props.get("bit_depth") or 24,
+            # bit-depth telt enkel voor PCM; bitrate enkel voor lossy.
+            "bit_depth": (src_props.get("bit_depth") or 24) if is_pcm else None,
             "samplerate": src_props.get("samplerate"),   # None -> bron-SR bij schrijven
-            "bitrate": src_props.get("bitrate_kbps") or 320}
+            "bitrate": None if is_pcm else (src_props.get("bitrate_kbps") or 320)}
 
 
 def resolve_export_spec(spec, src_props) -> dict:
@@ -559,8 +562,12 @@ def resolve_export_spec(spec, src_props) -> dict:
             if base.get(k) is not None:
                 out[k] = base[k]
         return out
+    is_pcm = fmt in PCM_FORMATS
     return {"fmt": fmt,
-            "bit_depth": base["bit_depth"] if base["bit_depth"] is not None else 24,
+            # PCM krijgt een default bit-depth (24); lossy houdt bit_depth=None zodat
+            # er geen betekenisloze bit-depth wordt gesuggereerd.
+            "bit_depth": ((base["bit_depth"] if base["bit_depth"] is not None else 24)
+                          if is_pcm else base["bit_depth"]),
             "samplerate": base["samplerate"],
             "bitrate": base["bitrate"] if base["bitrate"] is not None else 320}
 
@@ -616,11 +623,11 @@ def _apply_fade(audio, sr):
     return audio
 
 
-def cut_region(src_stereo, src_sr, t0, t1):
+def cut_region(src_audio, src_sr, t0, t1):
     """Knip [t0,t1] (met pad + anti-klik-fade) uit de originele mix."""
     i0 = max(0, int((t0 - CFG["pad_seconds"]) * src_sr))
-    i1 = min(src_stereo.shape[1], int((t1 + CFG["pad_seconds"]) * src_sr))
-    audio = src_stereo[:, i0:i1].astype(np.float32, copy=True)
+    i1 = min(src_audio.shape[1], int((t1 + CFG["pad_seconds"]) * src_sr))
+    audio = src_audio[:, i0:i1].astype(np.float32, copy=True)
     return _apply_fade(audio, src_sr)
 
 
@@ -644,14 +651,16 @@ def build_filename(meta, cand, res_tag, ext):
     return f"{artist}_{title}__{cand.type}__{pos}__{times}__{res_tag}.{ext}"
 
 
-def export_candidate(meta, cand, src_stereo, src_sr, src_props, out_dir, spec):
+def export_candidate(meta, cand, src_audio, src_sr, src_props, out_dir, spec):
     """Knip de mix-clip en schrijf hem in de gekozen resolutie."""
     import soundfile as sf
     import librosa
 
     res = resolve_export_spec(spec, src_props)
     fmt = res["fmt"].lower()
-    audio = cut_region(src_stereo, src_sr, cand.start, cand.end)
+    audio = cut_region(src_audio, src_sr, cand.start, cand.end)
+    if audio.shape[1] < 1:
+        raise ValueError("leeg venster (start >= end na padding)")
 
     out_sr = res["samplerate"] or src_sr
     if res["samplerate"] and res["samplerate"] != src_sr:
@@ -742,7 +751,7 @@ def export_one(input_path, out_dir, types, index, spec):
     if res["fmt"] not in PCM_FORMATS and (res.get("bit_depth") or 0) > 16:
         print("  LET OP: lossy export -- bit-depth telt niet; hogere resolutie "
               "voegt geen informatie toe.")
-    src, src_sr = load_source_stereo(input_path)
+    src, src_sr = load_source_audio(input_path)
     track_out = Path(out_dir) / Path(input_path).stem
     print(f"  export {len(cands)} clip(s) uit de mix als '{res['fmt']}' "
           f"-> {track_out}")
