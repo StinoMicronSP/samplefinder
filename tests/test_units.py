@@ -125,3 +125,31 @@ def test_ffmpeg_env_override(monkeypatch, tmp_path):
     assert sf._ffmpeg() == str(fake)
     monkeypatch.setenv("SAMPLEFINDER_FFMPEG", str(tmp_path / "nope"))   # bestaat niet
     assert sf._ffmpeg() != str(tmp_path / "nope")                      # genegeerd
+
+
+# ----------------------------------------------------------- gevoeligheid / stop
+def test_sensitivity_to_overrides_bounds_and_monotonic():
+    lo = sf.sensitivity_to_overrides(0)
+    mid = sf.sensitivity_to_overrides(70)
+    hi = sf.sensitivity_to_overrides(100)
+    # hoger = lossere gate (lagere sparseness_min) en ruimere solo-chroma
+    assert hi["sparseness_min"] < mid["sparseness_min"] < lo["sparseness_min"]
+    assert hi["solo_chroma_entropy_max"] > lo["solo_chroma_entropy_max"]
+    assert lo["solo_min_bars"] >= hi["solo_min_bars"] >= 1
+    assert set(lo).issubset(set(sf.CFG))                 # alle keys bestaan in CFG
+    assert sf.sensitivity_to_overrides(-5) == sf.sensitivity_to_overrides(0)      # clamp
+    assert sf.sensitivity_to_overrides(150) == sf.sensitivity_to_overrides(100)   # clamp
+
+
+def test_reset_cfg_restores_defaults():
+    sf.apply_cfg_overrides({"sparseness_min": 0.123})
+    assert sf.CFG["sparseness_min"] == 0.123
+    sf.reset_cfg()
+    assert sf.CFG == sf.CFG_DEFAULTS
+
+
+def test_analyze_one_cancellation(tmp_path):
+    import pytest
+    # een cancel die meteen True geeft -> direct AnalysisCancelled (raakt geen audio)
+    with pytest.raises(sf.AnalysisCancelled):
+        sf.analyze_one("x.wav", str(tmp_path), ["break"], "librosa", cancel=lambda: True)

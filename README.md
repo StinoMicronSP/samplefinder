@@ -15,9 +15,10 @@ exported clip is a candidate you can demux afterwards.
 ## Download (Windows)
 
 Grab `SampleFinder-<version>-win64.exe` from the [Releases](../../releases) page —
-a single file with **ffmpeg bundled in**, no Python needed. Double-click it to pick
-a file/folder, see the detected candidates, and choose an export resolution; or run
-it from a terminal exactly like the CLI below (`SampleFinder.exe analyze ...`).
+a single file with **ffmpeg bundled in**, no Python needed. Double-click it to pick a
+file/folder, set the **Sensitivity** slider (strict → loose = fewer → more
+candidates), Analyse, then choose an export resolution; **Stop** cancels a running
+job. Or run it from a terminal exactly like the CLI below (`SampleFinder.exe analyze ...`).
 
 ## How it works
 
@@ -81,9 +82,12 @@ python sample_finder.py export "track.wav"  --format flac --index 0 2
 ### Tuning detection thresholds
 
 Every `CFG` detection threshold is overridable at runtime — no source edits — on
-`analyze` and `run` (precedence: config file < named flags < `--set`):
+`analyze` and `run` (precedence: `--sensitivity` < config file < named flags < `--set`):
 
 ```bash
+# simplest: one global knob 0-100 (same as the GUI Sensitivity slider)
+python sample_finder.py analyze "track.mp3" --sensitivity 70
+
 # named flags (see `analyze --help` for the full list)
 python sample_finder.py analyze "track.mp3" --sparseness-min 0.42 --solo-chroma-entropy-max 0.82
 
