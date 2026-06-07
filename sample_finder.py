@@ -75,6 +75,36 @@ CFG = {
     "fade_ms": 5.0,
 }
 
+# Snapshot van de defaults zodat herhaalde runs (GUI) CFG kunnen resetten.
+CFG_DEFAULTS = dict(CFG)
+
+
+def reset_cfg():
+    """Herstel CFG naar de oorspronkelijke defaults (voor herhaalde GUI-runs)."""
+    CFG.clear()
+    CFG.update(CFG_DEFAULTS)
+
+
+def sensitivity_to_overrides(percent) -> dict:
+    """Map één 'gevoeligheid' (0=streng/weinig .. 100=los/veel) op meerdere
+    detectie-drempels ineens. Hoger = lossere grenzen = meer kandidaten."""
+    s = max(0.0, min(100.0, float(percent))) / 100.0
+    return {
+        "sparseness_min": round(0.60 - 0.30 * s, 4),
+        "break_perc_ratio_min": round(0.72 - 0.27 * s, 4),
+        "break_chroma_entropy_max": round(0.68 + 0.24 * s, 4),
+        "break_min_bars": 1,
+        "solo_perc_ratio_max": round(0.30 + 0.30 * s, 4),
+        "solo_chroma_entropy_max": round(0.55 + 0.40 * s, 4),
+        "solo_min_bars": max(1, int(round(3 - 2 * s))),
+        "tail_min_dur_s": round(0.60 - 0.40 * s, 4),
+    }
+
+
+class AnalysisCancelled(Exception):
+    """Door de gebruiker afgebroken analyse/export (GUI Stop-knop)."""
+
+
 # In te lezen / uit te schrijven formaten.
 AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".mp4", ".flac", ".aif", ".aiff",
               ".ogg", ".oga", ".wma", ".opus", ".aac"}
@@ -736,16 +766,23 @@ def print_candidates(cands):
               f"{c.score:>6.2f} {c.stem_hint:<7} {c.note}")
 
 
-def analyze_one(input_path, out_dir, types, beat_backend):
+def analyze_one(input_path, out_dir, types, beat_backend, cancel=None):
+    def _ck():
+        if cancel and cancel():
+            raise AnalysisCancelled()
+    _ck()
     print(f"  [1/3] structuur ({beat_backend}) ...")
     meta = read_metadata(input_path)
     src_props = probe_source_props(input_path)
     structure = get_structure(input_path, beat_backend)
+    _ck()
     print(f"        bpm~{structure['bpm']:.1f}, {len(structure['downbeats'])} downbeats")
     print("  [2/3] density-analyse op de mix ...")
     y = load_mix_mono(input_path, CFG["analysis_sr"])
+    _ck()
     total_dur = len(y) / CFG["analysis_sr"]
     feat = analyze_density(y, CFG["analysis_sr"])
+    _ck()
     print("  [3/3] kandidaten ...")
     cands = detect_candidates(feat, structure, total_dur, types)
     cands.sort(key=lambda c: c.score, reverse=True)
@@ -760,7 +797,7 @@ def analyze_one(input_path, out_dir, types, beat_backend):
     return meta, cands, js
 
 
-def export_one(input_path, out_dir, types, index, spec):
+def export_one(input_path, out_dir, types, index, spec, cancel=None):
     js = Path(out_dir) / (Path(input_path).stem + ".candidates.json")
     if not js.exists():
         print(f"  geen kandidaten-JSON voor {Path(input_path).name}; sla over.")
@@ -790,6 +827,8 @@ def export_one(input_path, out_dir, types, index, spec):
     print(f"  export {len(cands)} clip(s) uit de mix als '{res['fmt']}' "
           f"-> {track_out}")
     for c in cands:
+        if cancel and cancel():
+            raise AnalysisCancelled()
         print(f"  - {c.type} {c.start:.2f}-{c.end:.2f}s")
         try:
             export_candidate(meta, c, src, src_sr, src_props, track_out, spec)
@@ -898,7 +937,7 @@ def gui_main():
     root.title("Sample Finder v2  --  sparse-section finder")
     root.geometry("880x620")
     ui_q = queue.Queue()
-    state = {"files": [], "out_dir": None, "busy": False}
+    state = {"files": [], "out_dir": None, "busy": False, "cancel": threading.Event()}
 
     class _QueueWriter:
         def write(self, s):
@@ -944,12 +983,28 @@ def gui_main():
     ttk.Combobox(opt, textvariable=res_var, values=res_labels,
                  state="readonly", width=36).pack(side="left")
 
+    # --- gevoeligheid (zet meerdere drempels ineens; hoger = meer kandidaten) ---
+    opt2 = ttk.Frame(root, padding=(8, 4))
+    opt2.pack(fill="x")
+    ttk.Label(opt2, text="Gevoeligheid (streng → los):").pack(side="left")
+    sens_var = tk.DoubleVar(value=70.0)
+    sens_lbl = ttk.Label(opt2, text="70", width=4)
+
+    def _on_sens(_v):
+        sens_lbl.config(text=str(int(float(sens_var.get()))))
+
+    ttk.Scale(opt2, from_=0, to=100, variable=sens_var, command=_on_sens,
+              length=280).pack(side="left", padx=6)
+    sens_lbl.pack(side="left")
+
     act = ttk.Frame(root, padding=8)
     act.pack(fill="x")
     analyze_btn = ttk.Button(act, text="Analyseer")
     export_btn = ttk.Button(act, text="Exporteer alles")
+    stop_btn = ttk.Button(act, text="Stop", state="disabled")
     analyze_btn.pack(side="left")
     export_btn.pack(side="left", padx=6)
+    stop_btn.pack(side="left", padx=(0, 6))
     prog = ttk.Progressbar(act, mode="indeterminate")
     prog.pack(side="left", fill="x", expand=True, padx=6)
 
@@ -969,15 +1024,23 @@ def gui_main():
         state["busy"] = b
         analyze_btn.config(state="disabled" if b else "normal")
         export_btn.config(state="disabled" if b else "normal")
+        stop_btn.config(state="normal" if b else "disabled")
         (prog.start if b else prog.stop)()
 
     def in_thread(fn):
         if state["busy"]:
             return
+        state["cancel"].clear()                  # verse start
         set_busy(True)                           # synchroon, vermijdt dubbelklik-race
         threading.Thread(target=fn, daemon=True).start()
 
+    def request_stop():
+        if state["busy"]:
+            state["cancel"].set()
+            ui_q.put(("log", "\n[stop] bezig met afbreken (na de huidige stap)…\n"))
+
     def worker_analyze():
+        cancel = state["cancel"].is_set
         try:
             with contextlib.redirect_stdout(_QueueWriter()):
                 path = path_var.get().strip()
@@ -993,39 +1056,64 @@ def gui_main():
                 state["files"] = files
                 ui_q.put(("clear", None))
                 print(f"{len(files)} bestand(en). Output -> {state['out_dir']}")
+                reset_cfg()
+                apply_cfg_overrides(sensitivity_to_overrides(sens_var.get()))
                 resolve_tuning(search_dirs=[base])
+                print(f"[cfg] gevoeligheid={int(float(sens_var.get()))}  "
+                      f"sparseness_min={CFG['sparseness_min']}  "
+                      f"solo_chroma_entropy_max={CFG['solo_chroma_entropy_max']}")
+                cancelled = False
                 for f in files:
+                    if cancel():
+                        cancelled = True
+                        break
                     print(f"\n=== {f.name} ===")
                     try:
                         _m, cands, _js = analyze_one(
-                            str(f), state["out_dir"], ["break", "solo", "tail"], "librosa")
+                            str(f), state["out_dir"], ["break", "solo", "tail"],
+                            "librosa", cancel=cancel)
                         ui_q.put(("rows", [
                             (f.name, i, c.type, f"{c.start:.2f}", f"{c.end:.2f}",
                              f"{c.score:.2f}", c.stem_hint, c.note)
                             for i, c in enumerate(cands)]))
+                    except AnalysisCancelled:
+                        cancelled = True
+                        break
                     except Exception as e:
                         print(f"  FOUT: {e}")
-                print("\nKlaar met analyse.")
+                print("\n[gestopt door gebruiker]" if cancelled
+                      else "\nKlaar met analyse.")
         finally:
             ui_q.put(("busy", False))
 
     def worker_export():
+        cancel = state["cancel"].is_set
         try:
             with contextlib.redirect_stdout(_QueueWriter()):
                 if not state["files"]:
                     print("Analyseer eerst.")
                     return
                 spec = res_key_by_label.get(res_var.get(), "original")
+                cancelled = False
                 for f in state["files"]:
+                    if cancel():
+                        cancelled = True
+                        break
                     print(f"\n=== export {f.name} ===")
-                    export_one(str(f), state["out_dir"],
-                               ["break", "solo", "tail"], None, spec)
-                print(f"\nKlaar met export -> {state['out_dir']}")
+                    try:
+                        export_one(str(f), state["out_dir"],
+                                   ["break", "solo", "tail"], None, spec, cancel=cancel)
+                    except AnalysisCancelled:
+                        cancelled = True
+                        break
+                print("\n[gestopt door gebruiker]" if cancelled
+                      else f"\nKlaar met export -> {state['out_dir']}")
         finally:
             ui_q.put(("busy", False))
 
     analyze_btn.config(command=lambda: in_thread(worker_analyze))
     export_btn.config(command=lambda: in_thread(worker_export))
+    stop_btn.config(command=request_stop)
 
     def poll():
         try:
@@ -1074,7 +1162,10 @@ def add_tuning_args(sp):
     g = sp.add_argument_group(
         "drempels",
         "overschrijf CFG zonder de broncode te wijzigen "
-        "(prioriteit: config-bestand < losse vlaggen < --set)")
+        "(prioriteit: --sensitivity < config-bestand < losse vlaggen < --set)")
+    g.add_argument("--sensitivity", type=float, default=None, metavar="0-100",
+                   help="globale gevoeligheid 0=streng (weinig) .. 100=los (veel); "
+                        "zet meerdere drempels ineens (laagste prioriteit)")
     g.add_argument("--config", default=None,
                    help=f"JSON met CFG-overrides (auto: {CONFIG_FILENAME} naast invoer/werkmap)")
     g.add_argument("--set", dest="cfg_set", action="append", default=[],
@@ -1087,6 +1178,9 @@ def add_tuning_args(sp):
 def resolve_tuning(args=None, search_dirs=()):
     """Verzamel en pas CFG-overrides toe (config-bestand < vlaggen < --set)."""
     overrides = {}
+    sens = getattr(args, "sensitivity", None) if args else None
+    if sens is not None:
+        overrides.update(sensitivity_to_overrides(sens))
     cfg_path = getattr(args, "config", None) if args else None
     if not cfg_path:
         cfg_path = find_sidecar_config(list(search_dirs) + [Path.cwd()])
